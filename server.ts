@@ -732,8 +732,14 @@ app.post("/api/auth/send-otp", async (req: Request, res: Response) => {
   recentRequests.push(now);
   otpRequestTimes.set(otpKey, recentRequests);
 
-  // Generate 6-digit OTP
-  const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+  if (!IS_DEVELOPMENT && !getMailTransporter()) {
+    return res.status(503).json({
+      error: "Email verification is temporarily unavailable because SMTP is not configured.",
+    });
+  }
+
+  // Generate a cryptographically secure 6-digit OTP.
+  const otpCode = crypto.randomInt(100000, 1000000).toString();
   activeOtps.set(otpKey, {
     code: otpCode,
     expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
@@ -747,11 +753,18 @@ app.post("/api/auth/send-otp", async (req: Request, res: Response) => {
     expiresIn: "10m",
   });
 
+  if (!emailSent && !IS_DEVELOPMENT) {
+    activeOtps.delete(otpKey);
+    return res.status(503).json({
+      error: "We could not deliver the verification email. Please try again later.",
+    });
+  }
+
   res.json({
     success: true,
     message: emailSent
       ? `A verification code has been emailed to ${emailOrPhone}.`
-      : `OTP generated for ${emailOrPhone}. (Testing code: ${otpCode} or 123456).`,
+      : `Development OTP generated for ${emailOrPhone}.`,
     emailDispatched: emailSent,
     ...(IS_DEVELOPMENT ? { devOtp: otpCode } : {}),
   });

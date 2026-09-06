@@ -11,7 +11,7 @@ Prerequisite: Node.js 20 or newer.
 3. Start the development server with `npm run dev`.
 4. Open `http://localhost:3000`.
 
-The development server may return the generated OTP in its response for local testing. Production mode does not accept a fixed bypass code and requires configured email delivery.
+Development mode may return a generated OTP in its response for local testing. Production mode requires configured SMTP email delivery and does not accept a fixed bypass code.
 
 ## Validation
 
