@@ -4,6 +4,7 @@ import {
   Routes,
   Route,
   Link,
+  Navigate,
   useLocation,
   useNavigate,
   useParams,
@@ -137,7 +138,6 @@ const EmptyState: React.FC<EmptyStateProps> = ({ icon: Icon = FileText, text, ac
 function Login() {
   const [role, setRole] = useState("owner");
   const [email, setEmail] = useState("owner@maapsetu.demo");
-  const [password, setPassword] = useState("Password@123");
   const [otpSent, setOtpSent] = useState(false);
   const [otpCode, setOtpCode] = useState("");
   const [isSending, setIsSending] = useState(false);
@@ -170,17 +170,12 @@ function Login() {
       return;
     }
 
-    if (!password.trim()) {
-      setErrorMessage("Please enter your account password.");
-      return;
-    }
-
     setIsSending(true);
     try {
       const res = await demoApi.sendOtp(trimmedEmail);
       if (res?.data?.success || res?.success) {
         setOtpSent(true);
-        const emailDispatched = Boolean(res.data?.emailDispatched);
+        const emailDispatched = Boolean(res.emailDispatched);
         setIsLiveEmail(emailDispatched);
         if (emailDispatched) {
           setStatusMessage(
@@ -188,10 +183,10 @@ function Login() {
           );
         } else {
           setStatusMessage(
-            res.data?.message || `Verification code generated for ${trimmedEmail}.`
+            res.message || `Verification code generated for ${trimmedEmail}.`
           );
-          if (res.data?.devOtp) {
-            setDevOtpHint(res.data.devOtp);
+          if (res.devOtp) {
+            setDevOtpHint(res.devOtp);
           }
         }
       } else {
@@ -237,11 +232,13 @@ function Login() {
       }
 
       // Success: persist session
-      const userRole = res.data?.user?.role || role;
-      demoApi.setRole(userRole);
-      if (res.data?.user) {
-        demoApi.setUser(res.data.user);
+      const userRole = res.user?.role || role;
+      if (!res.token || !res.user) {
+        throw new Error("The server did not return a valid session.");
       }
+      demoApi.setToken(res.token);
+      demoApi.setRole(userRole);
+      demoApi.setUser(res.user);
       navigate("/dashboard");
     } catch (err: any) {
       setErrorMessage(
@@ -334,7 +331,7 @@ function Login() {
                 <span>{statusMessage}</span>
                 {devOtpHint && (
                   <div className="login-dev-hint">
-                    Testing Passcode: <strong>{devOtpHint}</strong> (or enter <strong>123456</strong>)
+                    Development OTP: <strong>{devOtpHint}</strong>
                   </div>
                 )}
               </div>
@@ -357,20 +354,6 @@ function Login() {
                 }}
                 placeholder="Enter email e.g. vinayydv0277@gmail.com or owner@maapsetu.demo"
                 autoComplete="email"
-              />
-
-              <label htmlFor="password">Password</label>
-              <input
-                id="password"
-                data-testid="login-password-input"
-                type="password"
-                value={password}
-                onChange={(e) => {
-                  setPassword(e.target.value);
-                  setErrorMessage("");
-                }}
-                placeholder="Enter account password"
-                autoComplete="current-password"
               />
 
               <Button
@@ -412,7 +395,7 @@ function Login() {
                   setOtpCode(e.target.value.replace(/[^0-9]/g, ""));
                   setErrorMessage("");
                 }}
-                placeholder="Enter 6-digit code (e.g. 123456)"
+                placeholder="Enter the 6-digit code"
                 autoFocus
               />
 
@@ -482,7 +465,7 @@ function Login() {
             </div>
             <p className="login-note" style={{ margin: "8px 0 0 0" }}>
               <ShieldCheck size={13} />
-              <span>Demo password: <code>Password@123</code> · Test bypass OTP: <code>123456</code></span>
+              <span>Use the one-time code delivered to your registered email.</span>
             </p>
           </div>
 
@@ -570,7 +553,10 @@ function Shell({ children }: { children: React.ReactNode }) {
           <button
             data-testid="sidebar-logout-button"
             className="logout"
-            onClick={() => navigate("/")}
+            onClick={() => {
+              void demoApi.logout();
+              navigate("/");
+            }}
           >
             <LogOut size={17} /> Sign out
           </button>
@@ -2214,6 +2200,9 @@ function AdminHome() {
     </>
   );
 }
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  return demoApi.isAuthenticated() ? <>{children}</> : <Navigate to="/" replace />;
+}
 function AppRoutes() {
   return (
     <Routes>
@@ -2223,8 +2212,9 @@ function AppRoutes() {
       <Route
         path="/*"
         element={
-          <Shell>
-            <Routes>
+          <ProtectedRoute>
+            <Shell>
+              <Routes>
               <Route path="dashboard" element={<Dashboard />} />
               <Route path="instruments" element={<Instruments />} />
               <Route path="instruments/new" element={<RegisterInstrument />} />
@@ -2255,8 +2245,9 @@ function AppRoutes() {
                 path="analytics"
                 element={<AdminPage type="analytics" />}
               />
-            </Routes>
-          </Shell>
+              </Routes>
+            </Shell>
+          </ProtectedRoute>
         }
       />
     </Routes>

@@ -1,20 +1,21 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# MaapSetu
 
-# Run and deploy your AI Studio app
+MaapSetu is a React and Express application for legal metrology instrument verification, inspection workflows, certificates, and public certificate lookup.
 
-This contains everything you need to run your app locally.
+## Local setup
 
-View your app in AI Studio: https://ai.studio/apps/89147512-4ccf-4094-9fad-80e80700a518
+Prerequisite: Node.js 20 or newer.
 
-## Run Locally
+1. Install dependencies with `npm ci`.
+2. Copy `.env.example` to `.env` and configure SMTP values when email delivery is required.
+3. Start the development server with `npm run dev`.
+4. Open `http://localhost:3000`.
 
-**Prerequisites:**  Node.js
+The development server may return the generated OTP in its response for local testing. Production mode does not accept a fixed bypass code and requires configured email delivery.
 
+## Validation
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+- `npm run lint` runs the TypeScript check.
+- `npm run build` creates the production frontend and server bundle.
+
+Runtime database and upload files are stored under `data/runtime` and `data/uploads`; both are intentionally ignored by Git.

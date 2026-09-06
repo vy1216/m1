@@ -4,11 +4,15 @@ type User = {
 };
 
 const request = async (path: string, options: RequestInit) => {
+  const token = localStorage.getItem("maapsetu_token");
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     ...options,
   });
-  const payload = await response.json();
+  const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     return { ...payload, success: false };
   }
@@ -31,14 +35,35 @@ export const demoApi = {
   },
 
   getRole() {
-    return localStorage.getItem("maapsetu_role") || "owner";
+    const role = localStorage.getItem("maapsetu_role");
+    return role === "owner" || role === "lmo" || role === "gatc" || role === "admin"
+      ? role
+      : "owner";
   },
 
   setRole(role: string) {
     localStorage.setItem("maapsetu_role", role);
   },
 
+  setToken(token: string) {
+    localStorage.setItem("maapsetu_token", token);
+  },
+
   setUser(user: User) {
     localStorage.setItem("maapsetu_user", JSON.stringify(user));
+  },
+
+  isAuthenticated() {
+    return Boolean(localStorage.getItem("maapsetu_token"));
+  },
+
+  async logout() {
+    try {
+      await request("/api/auth/logout", { method: "POST" });
+    } finally {
+      localStorage.removeItem("maapsetu_token");
+      localStorage.removeItem("maapsetu_role");
+      localStorage.removeItem("maapsetu_user");
+    }
   },
 };

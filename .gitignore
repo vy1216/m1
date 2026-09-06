@@ -8,3 +8,5 @@ coverage/
 bun.lock*
 .env*
 !.env.example
+data/runtime/
+data/uploads/

@@ -1,22 +1,27 @@
 import express, { Request, Response } from "express";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
+import "dotenv/config";
 import { createServer as createViteServer } from "vite";
 import { jsPDF } from "jspdf";
 import QRCode from "qrcode";
 import nodemailer from "nodemailer";
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
+const IS_DEVELOPMENT = process.env.NODE_ENV !== "production";
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
 // Increase payload limit for photo/document uploads
-app.use(express.json({ limit: "25mb" }));
-app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+app.use(express.json({ limit: "15mb" }));
+app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 
 // Ensure data directory exists
 const DATA_DIR = path.join(process.cwd(), "data");
 const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
-const DB_FILE = path.join(DATA_DIR, "maapsetu_db.json");
+const RUNTIME_DATA_DIR = path.join(DATA_DIR, "runtime");
+const DB_FILE = path.join(RUNTIME_DATA_DIR, "maapsetu_db.json");
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -24,9 +29,9 @@ if (!fs.existsSync(DATA_DIR)) {
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
-
-// Serve uploaded files statically
-app.use("/uploads", express.static(UPLOADS_DIR));
+if (!fs.existsSync(RUNTIME_DATA_DIR)) {
+  fs.mkdirSync(RUNTIME_DATA_DIR, { recursive: true });
+}
 
 // -------------------------------------------------------------
 // Database Interfaces
@@ -120,6 +125,61 @@ interface DatabaseSchema {
     weighingScaleValidity: string;
     fuelDispenserValidity: string;
     waterMeterValidity: string;
+  };
+}
+
+type AuthenticatedRequest = Request & { user?: UserRecord };
+
+function routeParam(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value[0] || "" : value || "";
+}
+
+const sessions = new Map<string, { userId: string; expiresAt: number }>();
+
+function getAuthenticatedUser(req: Request): UserRecord | null {
+  const authorization = req.header("authorization");
+  if (!authorization?.startsWith("Bearer ")) {
+    return null;
+  }
+
+  const token = authorization.slice("Bearer ".length).trim();
+  const session = sessions.get(token);
+  if (!session) {
+    return null;
+  }
+  if (session.expiresAt <= Date.now()) {
+    sessions.delete(token);
+    return null;
+  }
+
+  const user = db.users.find((candidate) => candidate.id === session.userId);
+  if (!user || user.status !== "active") {
+    sessions.delete(token);
+    return null;
+  }
+  return user;
+}
+
+function requireAuth(req: Request, res: Response, next: () => void) {
+  const user = getAuthenticatedUser(req);
+  if (!user) {
+    return res.status(401).json({ error: "Authentication required" });
+  }
+  (req as AuthenticatedRequest).user = user;
+  next();
+}
+
+function requireRole(...roles: UserRecord["role"][]) {
+  return (req: Request, res: Response, next: () => void) => {
+    const user = getAuthenticatedUser(req);
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    if (!roles.includes(user.role)) {
+      return res.status(403).json({ error: "Insufficient permissions" });
+    }
+    (req as AuthenticatedRequest).user = user;
+    next();
   };
 }
 
@@ -367,7 +427,9 @@ function loadDb(): DatabaseSchema {
 
 function saveDb(dataToSave: DatabaseSchema = db) {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(dataToSave, null, 2), "utf-8");
+    const temporaryFile = `${DB_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(temporaryFile, JSON.stringify(dataToSave, null, 2), "utf-8");
+    fs.renameSync(temporaryFile, DB_FILE);
   } catch (err) {
     console.error("Failed to persist database to disk:", err);
   }
@@ -397,6 +459,8 @@ interface OtpEntry {
 }
 
 const activeOtps = new Map<string, OtpEntry>();
+const otpRequestTimes = new Map<string, number[]>();
+const MAX_OTP_ATTEMPTS = 5;
 
 // Configure mail transporter if SMTP settings are present
 function getMailTransporter() {
@@ -624,6 +688,20 @@ async function generateOfficialPdfCertificate(cert: CertificateRecord): Promise<
 // API Endpoints
 // -------------------------------------------------------------
 
+app.get("/uploads/:filename", requireAuth, (req: Request, res: Response) => {
+  const requestedFilename = routeParam(req.params.filename);
+  const filename = path.basename(requestedFilename);
+  if (filename !== requestedFilename) {
+    return res.status(400).json({ error: "Invalid filename" });
+  }
+  res.sendFile(path.join(UPLOADS_DIR, filename), (error) => {
+    if (error && !res.headersSent) {
+      const statusCode = (error as NodeJS.ErrnoException & { statusCode?: number }).statusCode;
+      res.status(statusCode === 404 ? 404 : 500).json({ error: "File not found" });
+    }
+  });
+});
+
 // Health Check
 app.get("/api/health", (req: Request, res: Response) => {
   res.json({
@@ -631,21 +709,32 @@ app.get("/api/health", (req: Request, res: Response) => {
     service: "MaapSetu Metrology Fullstack API",
     version: "2.0.0",
     smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER),
-    persistentStore: "active (data/maapsetu_db.json)",
+    persistentStore: "active (data/runtime/maapsetu_db.json)",
     timestamp: new Date().toISOString(),
   });
 });
 
 // =================== AUTH & OTP DISPATCH ===================
 app.post("/api/auth/send-otp", async (req: Request, res: Response) => {
-  const { emailOrPhone } = req.body;
-  if (!emailOrPhone) {
+  const emailOrPhone = String(req.body.emailOrPhone || "").trim();
+  if (!emailOrPhone || emailOrPhone.length > 160) {
     return res.status(400).json({ error: "Email or phone number is required" });
   }
 
+  const otpKey = emailOrPhone.toLowerCase();
+  const now = Date.now();
+  const recentRequests = (otpRequestTimes.get(otpKey) || []).filter(
+    (timestamp) => timestamp > now - 15 * 60 * 1000,
+  );
+  if (recentRequests.length >= 5) {
+    return res.status(429).json({ error: "Too many OTP requests. Try again later." });
+  }
+  recentRequests.push(now);
+  otpRequestTimes.set(otpKey, recentRequests);
+
   // Generate 6-digit OTP
   const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-  activeOtps.set(emailOrPhone.trim().toLowerCase(), {
+  activeOtps.set(otpKey, {
     code: otpCode,
     expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
     attempts: 0,
@@ -664,7 +753,7 @@ app.post("/api/auth/send-otp", async (req: Request, res: Response) => {
       ? `A verification code has been emailed to ${emailOrPhone}.`
       : `OTP generated for ${emailOrPhone}. (Testing code: ${otpCode} or 123456).`,
     emailDispatched: emailSent,
-    devOtp: otpCode,
+    ...(IS_DEVELOPMENT ? { devOtp: otpCode } : {}),
   });
 });
 
@@ -672,15 +761,18 @@ app.post("/api/auth/login", (req: Request, res: Response) => {
   const { role, email, phone, otp } = req.body;
   const identifier = (email || phone || "").trim().toLowerCase();
 
-  // Validate OTP: accept valid active OTP or universal dev bypass 123456
+  // Validate only the generated OTP. A fixed development bypass is never accepted.
   let isValidOtp = false;
-  if (otp === "123456") {
-    isValidOtp = true;
-  } else if (identifier && activeOtps.has(identifier)) {
+  if (identifier && activeOtps.has(identifier)) {
     const entry = activeOtps.get(identifier)!;
-    if (Date.now() <= entry.expiresAt && entry.code === otp) {
+    if (Date.now() <= entry.expiresAt && entry.attempts < MAX_OTP_ATTEMPTS && entry.code === otp) {
       isValidOtp = true;
       activeOtps.delete(identifier);
+    } else {
+      entry.attempts += 1;
+      if (entry.attempts >= MAX_OTP_ATTEMPTS || Date.now() > entry.expiresAt) {
+        activeOtps.delete(identifier);
+      }
     }
   }
 
@@ -700,6 +792,9 @@ app.post("/api/auth/login", (req: Request, res: Response) => {
 
   // If new user email provided, register them dynamically so real users work seamlessly
   if (!user && identifier) {
+    if (role && role !== "owner") {
+      return res.status(403).json({ error: "This role requires an approved account" });
+    }
     const nameFromEmail = identifier.includes("@")
       ? identifier.split("@")[0].replace(/[._-]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
       : "Authorized Custodian";
@@ -723,23 +818,35 @@ app.post("/api/auth/login", (req: Request, res: Response) => {
 
   recordAudit("auth.login_success", user.name, `role:${user.role}`);
 
+  const token = crypto.randomBytes(32).toString("hex");
+  sessions.set(token, { userId: user.id, expiresAt: Date.now() + SESSION_TTL_MS });
+
   res.json({
     success: true,
     user,
-    token: `ms-token-${user.id}-${Date.now()}`,
+    token,
+    expiresAt: Date.now() + SESSION_TTL_MS,
   });
 });
 
-app.get("/api/users", (req: Request, res: Response) => {
+app.post("/api/auth/logout", requireAuth, (req: Request, res: Response) => {
+  const authorization = req.header("authorization");
+  if (authorization?.startsWith("Bearer ")) {
+    sessions.delete(authorization.slice("Bearer ".length).trim());
+  }
+  res.json({ success: true });
+});
+
+app.get("/api/users", requireRole("admin"), (req: Request, res: Response) => {
   res.json({ users: db.users });
 });
 
 // =================== INSTRUMENTS ===================
-app.get("/api/instruments", (req: Request, res: Response) => {
+app.get("/api/instruments", requireAuth, (req: Request, res: Response) => {
   res.json({ instruments: db.instruments });
 });
 
-app.post("/api/instruments", (req: Request, res: Response) => {
+app.post("/api/instruments", requireRole("owner"), (req: Request, res: Response) => {
   const { type, serial, make, model, capacity, accuracyClass, address, photoUrl } = req.body;
   if (!serial) {
     return res.status(400).json({ error: "Serial number is required" });
@@ -777,7 +884,7 @@ app.post("/api/instruments", (req: Request, res: Response) => {
 });
 
 // =================== APPLICATIONS & RULE 14 ENGINE ===================
-app.get("/api/applications", (req: Request, res: Response) => {
+app.get("/api/applications", requireAuth, (req: Request, res: Response) => {
   const { assignedOnly } = req.query;
   if (assignedOnly === "true") {
     const queue = db.applications.filter((a) => a.status === "assigned" || a.status === "in_progress");
@@ -786,7 +893,7 @@ app.get("/api/applications", (req: Request, res: Response) => {
   res.json({ applications: db.applications });
 });
 
-app.get("/api/applications/:id", (req: Request, res: Response) => {
+app.get("/api/applications/:id", requireAuth, (req: Request, res: Response) => {
   const appItem = db.applications.find((a) => a.id === req.params.id);
   if (!appItem) {
     return res.status(404).json({ error: "Application not found" });
@@ -794,7 +901,7 @@ app.get("/api/applications/:id", (req: Request, res: Response) => {
   res.json({ application: appItem });
 });
 
-app.post("/api/applications", (req: Request, res: Response) => {
+app.post("/api/applications", requireRole("owner"), (req: Request, res: Response) => {
   const { instrumentSerial, applicationType, photos, paymentReference } = req.body;
   const instrument = db.instruments.find((i) => i.serial === instrumentSerial) || db.instruments[0];
 
@@ -837,7 +944,7 @@ app.post("/api/applications", (req: Request, res: Response) => {
 });
 
 // =================== PAYMENTS & TREASURY RECEIPT ===================
-app.post("/api/payments/checkout", (req: Request, res: Response) => {
+app.post("/api/payments/checkout", requireRole("owner"), (req: Request, res: Response) => {
   const { instrumentType, serialNumber } = req.body;
   const baseFee = instrumentType === "Fuel dispenser" ? 1500 : 450;
   const cess = 50;
@@ -852,7 +959,7 @@ app.post("/api/payments/checkout", (req: Request, res: Response) => {
     applicationId: `APPL-${serialNumber || "NEW"}`,
     amount: total,
     currency: "INR",
-    status: "completed",
+    status: "pending",
     paymentMethod: "Bharat BillPay / UPI Gateway",
     createdAt: new Date().toISOString(),
     receiptNumber: receiptNum,
@@ -876,12 +983,12 @@ app.post("/api/payments/checkout", (req: Request, res: Response) => {
       gst: gst,
       totalPayable: total,
     },
-    message: "Statutory fee transaction confirmed by Treasury.",
+    message: "Payment request created and awaiting treasury confirmation.",
   });
 });
 
 // =================== DOCUMENT & PHOTO UPLOADS ===================
-app.post("/api/upload", (req: Request, res: Response) => {
+app.post("/api/upload", requireAuth, (req: Request, res: Response) => {
   const { dataUrl, filename } = req.body;
   if (!dataUrl) {
     return res.status(400).json({ error: "Missing dataUrl" });
@@ -893,12 +1000,23 @@ app.post("/api/upload", (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid base64 payload" });
     }
 
-    const ext = matches[1].split("/")[1] || "png";
-    const baseName = filename ? filename.replace(/[^a-zA-Z0-9_-]/g, "") : `upload-${Date.now()}`;
-    const safeFileName = `${baseName}.${ext}`;
-    const filePath = path.join(UPLOADS_DIR, safeFileName);
-
+    const mimeType = matches[1].toLowerCase();
+    const extensionByMimeType: Record<string, string> = {
+      "image/jpeg": "jpg",
+      "image/png": "png",
+      "image/webp": "webp",
+      "application/pdf": "pdf",
+    };
+    const ext = extensionByMimeType[mimeType];
+    if (!ext) {
+      return res.status(415).json({ error: "Only JPEG, PNG, WebP, and PDF uploads are supported" });
+    }
     const buffer = Buffer.from(matches[2], "base64");
+    if (buffer.length > 10 * 1024 * 1024) {
+      return res.status(413).json({ error: "File exceeds the 10 MB limit" });
+    }
+    const safeFileName = `${crypto.randomBytes(16).toString("hex")}.${ext}`;
+    const filePath = path.join(UPLOADS_DIR, safeFileName);
     fs.writeFileSync(filePath, buffer);
 
     const publicUrl = `/uploads/${safeFileName}`;
@@ -910,12 +1028,8 @@ app.post("/api/upload", (req: Request, res: Response) => {
 });
 
 // =================== INSPECTIONS & MINTING ===================
-app.post("/api/inspections", (req: Request, res: Response) => {
+app.post("/api/inspections", requireRole("lmo", "gatc"), (req: Request, res: Response) => {
   const { applicationId, result, rejectionReason, otp, gpsCoords, readings } = req.body;
-
-  if (otp && otp !== "123456") {
-    return res.status(400).json({ error: "Officer OTP authorization failed. Enter 123456." });
-  }
 
   const appItem = db.applications.find((a) => a.id === applicationId);
   if (!appItem) {
@@ -985,12 +1099,12 @@ app.post("/api/inspections", (req: Request, res: Response) => {
 });
 
 // =================== CERTIFICATES & PDF DOWNLOAD ===================
-app.get("/api/certificates", (req: Request, res: Response) => {
+app.get("/api/certificates", requireAuth, (req: Request, res: Response) => {
   res.json({ certificates: db.certificates });
 });
 
-app.get("/api/certificates/:id", (req: Request, res: Response) => {
-  const query = req.params.id;
+app.get("/api/certificates/:id", requireAuth, (req: Request, res: Response) => {
+  const query = routeParam(req.params.id);
   const cert = db.certificates.find(
     (c) => c.id === query || c.certificateNumber.toLowerCase() === query.toLowerCase()
   );
@@ -1001,8 +1115,8 @@ app.get("/api/certificates/:id", (req: Request, res: Response) => {
 });
 
 // Download Official PDF
-app.get("/api/certificates/:id/pdf", async (req: Request, res: Response) => {
-  const query = req.params.id;
+app.get("/api/certificates/:id/pdf", requireAuth, async (req: Request, res: Response) => {
+  const query = routeParam(req.params.id);
   const cert = db.certificates.find(
     (c) => c.id === query || c.certificateNumber.toLowerCase() === query.toLowerCase()
   );
@@ -1024,7 +1138,7 @@ app.get("/api/certificates/:id/pdf", async (req: Request, res: Response) => {
   }
 });
 
-app.post("/api/certificates/:id/revoke", (req: Request, res: Response) => {
+app.post("/api/certificates/:id/revoke", requireRole("admin"), (req: Request, res: Response) => {
   const { reason } = req.body;
   const cert = db.certificates.find((c) => c.id === req.params.id || c.certificateNumber === req.params.id);
   if (!cert) {
@@ -1040,12 +1154,13 @@ app.post("/api/certificates/:id/revoke", (req: Request, res: Response) => {
 
 // =================== PUBLIC VERIFICATION ===================
 app.get("/api/verify/:query", (req: Request, res: Response) => {
-  const query = req.params.query.trim().toLowerCase();
+  const rawQuery = routeParam(req.params.query);
+  const query = rawQuery.trim().toLowerCase();
   const cert = db.certificates.find(
     (c) => c.certificateNumber.toLowerCase() === query || c.serialNumber.toLowerCase() === query
   );
 
-  recordAudit("verify.public_lookup", "Anonymous Public User", req.params.query);
+  recordAudit("verify.public_lookup", "Anonymous Public User", rawQuery);
 
   if (!cert) {
     return res.status(404).json({
@@ -1069,22 +1184,22 @@ app.get("/api/verify/:query", (req: Request, res: Response) => {
 });
 
 // =================== RULES & AUDIT TRAIL ===================
-app.get("/api/rules", (req: Request, res: Response) => {
+app.get("/api/rules", requireAuth, (req: Request, res: Response) => {
   res.json({ rules: db.rulesConfig });
 });
 
-app.put("/api/rules", (req: Request, res: Response) => {
+app.put("/api/rules", requireRole("admin"), (req: Request, res: Response) => {
   db.rulesConfig = { ...db.rulesConfig, ...req.body };
   saveDb();
   recordAudit("rules.updated", "System Admin", "rules_config", req.body);
   res.json({ success: true, rules: db.rulesConfig });
 });
 
-app.get("/api/audit", (req: Request, res: Response) => {
+app.get("/api/audit", requireRole("admin"), (req: Request, res: Response) => {
   res.json({ auditLogs: db.auditLogs });
 });
 
-app.get("/api/analytics", (req: Request, res: Response) => {
+app.get("/api/analytics", requireRole("admin"), (req: Request, res: Response) => {
   res.json({
     pendencyByJurisdiction: [
       { name: "Central", value: 74 },
@@ -1111,7 +1226,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req: Request, res: Response) => {
+    app.use((req: Request, res: Response) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
